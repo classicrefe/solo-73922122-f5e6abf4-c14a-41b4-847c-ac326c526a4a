@@ -37,14 +37,15 @@ app/
   db.py         asyncpg 连接池 + jsonb codec
   csvutil.py    严格 CSV 解析（1~1000片、片号批内唯一、厚度正整数）
   storage.py    原件内容寻址持久化（tmp+fsync+原子rename）
-  service.py    受理（幂等/冲突）、查询、供数读模型
+  service.py    受理（幂等/冲突）、查询、供数读模型、快照封存/读取
   worker.py     后台判定 worker（设备咨询锁 + 单事务原子判定）
   main.py       FastAPI 路由、生命周期（每实例启动一个 worker）
 scripts/
   worker_harness.py  单实例 worker 驱动（提交/慢批/崩溃标记/空闲退出）
   demo_local.py      本地双实例端到端演示（便携 Postgres）
+  demo_snapshot.py   本地双实例快照演示（封存/冻结/幂等/冲突/拒绝）
   demo_compose.sh    Docker Compose 栈演示
-tests/          pytest：CSV、API 规则、双 worker 并发、崩溃恢复（23 个）
+tests/          pytest：CSV、API 规则、双 worker 并发、崩溃恢复、快照（35 个）
 deploy/nginx/   双实例轮询负载均衡
 docker-compose.yml  db + api1 + api2 + nginx
 ```
@@ -55,7 +56,7 @@ docker-compose.yml  db + api1 + api2 + nginx
 docker compose up --build -d
 # API 文档（Swagger UI）
 open http://localhost:8080/docs
-# 端到端演示：受理/幂等/漂移/慢批FIFO/容器崩溃接续/供数隔离
+# 端到端演示：受理/幂等/漂移/慢批FIFO/容器崩溃接续/供数隔离/快照封存
 bash scripts/demo_compose.sh
 ```
 
@@ -71,6 +72,7 @@ pip install -r requirements.txt pgserver pytest pytest-asyncio httpx python-mult
 export DATABASE_DSN=...          # 见 scripts/start_test_db.py
 uvicorn app.main:app --port 8000 # 可启动第二个实例换端口即可
 python -m scripts.demo_local     # 慢批 + 崩溃接续完整演示
+python -m scripts.demo_snapshot  # 双实例快照：封存/冻结/幂等/冲突/拒绝
 ```
 
 ## API 摘要
@@ -81,8 +83,45 @@ python -m scripts.demo_local     # 慢批 + 崩溃接续完整演示
 | `GET /batches/{batch_no}` | 判定结果、中位数、偏差、参考批号、原件路径、尝试次数、决定实例 |
 | `GET /devices/{device_id}/batches` | 按设备列受理顺序与状态 |
 | `GET /data/released` | 供数接口，**仅放行**批的晶圆明细，支持 device/batch 过滤与分页 |
+| `POST /snapshots` | 封存设备连续受理序号区间（≤20 批）的供数快照；新封 `201`，同请求号重放 `200`，同号异参 `409`，区间含未受理序号 `400` |
+| `GET /snapshots/{snapshot_no}` | 按快照号读取封存内容，永远与封存时一致 |
 | `GET /health` | 存活与数据库连通性 |
 | `POST /internal/shutdown?token=` | 仅演示用；未设 `SHUTDOWN_TOKEN` 时返回 404，不出现在 OpenAPI |
+
+## 快照（交接封存）
+
+入湖工程师交接时，把某设备一段连续批次的供数状态封存下来，供下游按当时
+口径复算。
+
+```bash
+curl -sS -X POST http://localhost:8080/snapshots -H 'Content-Type: application/json' -d '{
+  "device_id": "EQ-A",
+  "start_accept_seq": 1,
+  "end_accept_seq": 20,
+  "request_no": "handoff-2026-11-18-001"
+}'
+curl -sS http://localhost:8080/snapshots/SNP-xxxx
+```
+
+语义：
+
+* **同一起始状态**：整个封存在一个 `REPEATABLE READ` 事务内完成，区间内各批
+  的结论、晶圆明细与参考信息来自同一个已提交状态；封存期间其它事务的判定、
+  上传照常进行（不持有设备锁、不阻塞 worker 或受理）。
+* **内容**：放行批记录当时的 `median_nm`、`ref_mean_nm`、`deviation_nm`、
+  参考批号 `reference_batch_nos` 及其各自中位数 `reference_medians_nm`、
+  晶圆明细 `wafers`；待判定 `PENDING` 与隔离 `QUARANTINED` 批只记录状态
+  （明细字段为 `null`/空）。`totals` 给出区间批数、放行/隔离/待判定数与
+  放行片数。
+* **冻结**：读接口只查 `snapshot_*` 表，不 join 源表。待判定批后来放行、
+  隔离批被复查、甚至源批被清理，按快照号读到的内容与总数都不变。
+* **区间校验**：区间必须由该设备**连续已受理**的序号组成；含未受理/缺口
+  序号返回 `400`，不写入任何行。
+* **幂等**：`request_no` 为幂等键。双实例并发提交同一请求号、或响应丢失后
+  重试，都返回**同一快照**（并发时一个 `201`、其余 `200`）；同号不同参数
+  （设备/起止序号）返回 `409`，`existing` 给出已封存快照标识。
+* **无半份结果**：快照头、批次行、晶圆行与统计在同一事务写入；任何失败整体
+  回滚，读不到半份结果，请求号也未被占用，可安全重试。
 
 ### CSV 格式
 
@@ -99,10 +138,13 @@ W002,508
 ```bash
 DATABASE_DSN=<postgres dsn> python -m pytest -q
 ```
-28 个用例覆盖：CSV 边界与非法输入、前三批基线、>5nm 隔离与临界 5nm 放行、
+35 个用例覆盖：CSV 边界与非法输入、前三批基线、>5nm 隔离与临界 5nm 放行、
 隔离批不进参考窗、滚动窗口滑动、幂等重试与 409 冲突、供数不可见隔离批、
 双 worker 同设备 FIFO 与跨设备并行、小连接池下高并发同设备受理无死锁（回归）、
-真实子进程硬退出后的接续与无半批。
+真实子进程硬退出后的接续与无半批；以及快照：单次已提交状态封存、待判定批
+后来放行后按号读取不变、源批删除后仍不变、区间缺口/超 20 批/未知设备拒绝、
+同请求号并发与重试返回同一快照、同号异参 409、封存失败无半份结果且请求号可复用、
+封存期间上传与判定不被阻塞。
 
 ## 演示中的慢批/崩溃钩子（仅测试用途）
 

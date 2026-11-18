@@ -11,7 +11,9 @@
 #   3. slow head-of-line batch: same-device FIFO, other devices unaffected;
 #   4. container crash: `docker stop`-like failure mid-batch, survivor takes
 #      over with no half batch and no double reference advancement;
-#   5. the data endpoint serves released batches only.
+#   5. the data endpoint serves released batches only;
+#   6. sealed snapshots: frozen pending status, released detail + references,
+#      identical retry / conflicting parameters, unaccepted range rejection.
 set -euo pipefail
 
 BASE="${BASE:-http://localhost:8080}"
@@ -103,5 +105,52 @@ curl -sS "$BASE/batches/CRASH-4" | j
 
 echo; echo "== 6. data lake endpoint hides quarantined batches =="
 curl -sS "$BASE/data/released?device_id=$DEV" | j | grep -E 'total_released|batch_no'
+
+echo; echo "== 7. sealed snapshot: detail, freeze, idempotency, conflict =="
+SDEV="${DEV}-SNAP"
+for i in 1 2 3; do csv "N$i" 500 5 > "/tmp/n$i.csv"; post "SNAP-$i" "$SDEV" "/tmp/n$i.csv" >/dev/null; done
+for i in 1 2 3; do echo "  SNAP-$i -> $(wait_decided "SNAP-$i")"; done
+csv NQ 900 5 > /tmp/nq.csv; post SNAP-Q "$SDEV" /tmp/nq.csv >/dev/null
+csv NP 502 5 > /tmp/np.csv; post SNAP-P "$SDEV" /tmp/np.csv >/dev/null
+echo "  SNAP-Q -> $(wait_decided SNAP-Q), SNAP-P -> $(wait_decided SNAP-P)"
+
+REQ="REQ-COMPOSE-$$"
+seal() { curl -sS -o /tmp/seal_body.json -w '%{http_code}' -X POST "$BASE/snapshots" \
+  -H 'Content-Type: application/json' \
+  -d "{\"device_id\":\"$1\",\"start_accept_seq\":$2,\"end_accept_seq\":$3,\"request_no\":\"$4\"}"; }
+
+first_code=$(seal "$SDEV" 1 4 "$REQ")
+SNAP_NO=$(python3 -c 'import json;print(json.load(open("/tmp/seal_body.json"))["snapshot_no"])')
+echo "  seal 1..4 -> HTTP $first_code snapshot=$SNAP_NO"
+curl -sS "$BASE/snapshots/$SNAP_NO" | j | grep -E 'snapshot_no|released|quarantined|wafers|reference_batch_nos|status' | head -20
+# Seed one more batch and seal it immediately.  It is normally still PENDING
+# at seal time; the sealed response is captured and compared after the worker
+# decides it, proving the by-number read is frozen either way.  (The pytest
+# suite seals PENDING deterministically by pausing the worker.)
+csv NPEND 504 5 > /tmp/npend.csv
+post SNAP-PEND "$SDEV" /tmp/npend.csv >/dev/null
+pend_code=$(seal "$SDEV" 5 5 "REQ-PEND-$$")
+cp /tmp/seal_body.json /tmp/seal_pending.json
+PEND_NO=$(python3 -c 'import json;print(json.load(open("/tmp/seal_body.json"))["snapshot_no"])')
+PEND_STATUS=$(python3 -c 'import json;print(json.load(open("/tmp/seal_body.json"))["batches"][0]["status"])')
+echo "  sealed seq5 while $PEND_STATUS -> HTTP $pend_code snapshot=$PEND_NO"
+echo "  SNAP-PEND later -> $(wait_decided SNAP-PEND); re-read snapshot:"
+curl -sS "$BASE/snapshots/$PEND_NO" -o /tmp/seal_reread.json
+python3 - <<'PY'
+import json
+sealed = json.load(open("/tmp/seal_pending.json"))
+again = json.load(open("/tmp/seal_reread.json"))
+b = again["batches"][0]
+print("   frozen status=%s wafers=%d totals=%s"
+      % (b["status"], len(b["wafers"]), again["totals"]))
+assert again == sealed, "snapshot changed after the batch was decided!"
+print("   by-number read identical to the seal response")
+PY
+echo "  retry same request_no -> $(seal "$SDEV" 1 4 "$REQ")"
+echo "  same request_no, different params -> $(seal "$SDEV" 1 3 "$REQ")"
+echo "  range with unaccepted seq -> $(seal "$SDEV" 1 9 "REQ-GAP-$$")"
+echo "  unknown snapshot -> $(curl -sS -o /dev/null -w '%{http_code}' "$BASE/snapshots/SNP-nope")"
+echo "  other device still flows: $(post SNAP-OK "${DEV}-SNAP2" /tmp/n1.csv | tail -1) / $(wait_decided SNAP-OK)"
+
 echo
 echo "OpenAPI docs: $BASE/docs"

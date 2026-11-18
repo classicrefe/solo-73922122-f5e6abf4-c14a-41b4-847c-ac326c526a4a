@@ -76,6 +76,39 @@ def upload(port: str, batch_no: str, device: str, thickness: int,
                 f"multipart/form-data; boundary={boundary}")
 
 
+class DeviceLock:
+    """Hold one device's worker advisory lock from a dedicated event loop.
+
+    Used by the slow-batch demo to make the ordering deterministic: while the
+    lock is held no worker may decide that device, so the slow marker can be
+    installed for a batch whose id is already known.  Both calls must share
+    one event loop, hence the persistent loop object.
+    """
+
+    def __init__(self, dsn: str, device: str):
+        self.dsn = dsn
+        self.device = device
+        self.loop = asyncio.new_event_loop()
+        self.conn = None
+
+    def acquire(self) -> None:
+        async def _do():
+            import asyncpg
+            self.conn = await asyncpg.connect(self.dsn)
+            got = await self.conn.fetchval(
+                "SELECT pg_try_advisory_lock(78219001, hashtext($1))",
+                self.device)
+            assert got, "could not take the device advisory lock"
+        self.loop.run_until_complete(_do())
+
+    def release(self) -> None:
+        async def _do():
+            await self.conn.execute("SELECT pg_advisory_unlock_all()")
+            await self.conn.close()
+        self.loop.run_until_complete(_do())
+        self.loop.close()
+
+
 def wait_status(port: str, batch_no: str, timeout: float = 40.0) -> dict:
     deadline = time.time() + timeout
     last = {}
@@ -173,17 +206,25 @@ def main() -> int:
     api1.start(); api2.start()
     run = uuid.uuid4().hex[:6]
     dev_f, dev_g = f"F-{run}", f"G-{run}"
-    code, f1 = upload(port1, f"{run}-F1", dev_f, 500)
-    assert code == 202, f1
-    f1_id = f1["batch_id"]
-    upload(port2, f"{run}-F2", dev_f, 500)
-    upload(port1, f"{run}-F3", dev_f, 504)
-    # Another device flows immediately despite the slow F device.
-    upload(port1, f"{run}-G1", dev_g, 700)
-    upload(port2, f"{run}-G2", dev_g, 700)
-    with open(os.path.join(raw_dir, "slow_batches.txt"), "w") as fh:
-        fh.write(f"{f1_id}:6\n")
-    print(f"  marked batch id={f1_id} as SLOW (6s), device {dev_f}")
+    # Hold the F device's lock while seeding so no worker can decide F1
+    # before its slow marker exists (otherwise the marker write races the
+    # decision and the demo's PENDING assertion sees an already released F1).
+    f_lock = DeviceLock(dsn, dev_f)
+    f_lock.acquire()
+    try:
+        code, f1 = upload(port1, f"{run}-F1", dev_f, 500)
+        assert code == 202, f1
+        f1_id = f1["batch_id"]
+        upload(port2, f"{run}-F2", dev_f, 500)
+        upload(port1, f"{run}-F3", dev_f, 504)
+        # Another device flows immediately despite the slow F device.
+        upload(port1, f"{run}-G1", dev_g, 700)
+        upload(port2, f"{run}-G2", dev_g, 700)
+        with open(os.path.join(raw_dir, "slow_batches.txt"), "w") as fh:
+            fh.write(f"{f1_id}:6\n")
+        print(f"  marked batch id={f1_id} as SLOW (6s), device {dev_f}")
+    finally:
+        f_lock.release()
     time.sleep(1.5)
 
     _, f1_now = http("GET", f"http://127.0.0.1:{port2}/batches/{run}-F1")
@@ -206,16 +247,22 @@ def main() -> int:
     api1.shutdown(); api2.shutdown()
 
     # Restart api2 briefly just to ingest the four K batches, then stop it so
-    # nothing has decided them yet.
+    # nothing has decided them yet.  Hold the K device lock while ingesting so
+    # no worker can decide them in the meantime (otherwise the queue may drain
+    # between upload and shutdown).
     api2 = ApiInstance("api2", port2, {**common_env, "INSTANCE_ID": "api2"},
                        os.path.join(workdir, "api2.log"))
     api2.start()
-    code, k1_accept = upload(port2, f"{run}-K1", dev_k, 500)
-    assert code == 202, k1_accept
-    upload(port2, f"{run}-K2", dev_k, 500)
-    upload(port2, f"{run}-K3", dev_k, 500)
-    upload(port2, f"{run}-K4", dev_k, 504)
-    # Give the workers no time to process before shutting down.
+    k_lock = DeviceLock(dsn, dev_k)
+    k_lock.acquire()
+    try:
+        code, k1_accept = upload(port2, f"{run}-K1", dev_k, 500)
+        assert code == 202, k1_accept
+        upload(port2, f"{run}-K2", dev_k, 500)
+        upload(port2, f"{run}-K3", dev_k, 500)
+        upload(port2, f"{run}-K4", dev_k, 504)
+    finally:
+        k_lock.release()
     api2.shutdown()
     mid0 = asyncio.run(_peek_pending(dsn, k1_accept["batch_id"]))
     assert mid0["status"] == "PENDING", mid0
